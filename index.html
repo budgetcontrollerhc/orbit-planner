@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Orbit — Day &amp; Week Planner</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
 
@@ -268,7 +269,12 @@
 
   <div class="sync-bar">
     <div class="sync-group">
-      <span class="sync-label">Calendar sync (.ics — Google, Outlook, Apple &amp; more)</span>
+      <span class="sync-label">Google Calendar</span>
+      <button class="btn google" id="gcalConnectBtn"><span class="dot" id="gcalDot" style="background:var(--text-faint)"></span>Connect</button>
+      <button class="btn google" id="gcalImportBtn" disabled>Import this range</button>
+    </div>
+    <div class="sync-group">
+      <span class="sync-label">Universal (.ics — Outlook, Apple &amp; more)</span>
       <button class="btn" id="icsExportBtn">Export .ics</button>
       <button class="btn" id="icsImportBtn">Import .ics</button>
       <input type="file" id="icsFileInput" accept=".ics" />
@@ -594,6 +600,7 @@
           <div class="title">${escapeHtml(t.title)}</div>
           <div class="sub">${timeStr}${!compact && t.duration ? ' · ' + t.duration + 'm' : ''} · ${t.type}</div>
         </div>
+        <div class="push" data-push="${t.id}" title="Push this to Google Calendar">↥ Google</div>
         <div class="x" data-del="${t.id}">✕</div>
       </div>
     `;
@@ -651,6 +658,12 @@
       el.addEventListener('click', ()=>{
         tasks = tasks.filter(t => t.id !== el.dataset.del);
         renderAll();
+      });
+    });
+    document.querySelectorAll('[data-push]').forEach(el=>{
+      el.addEventListener('click', ()=>{
+        const t = tasks.find(x=>x.id === el.dataset.push);
+        if(t) pushToGoogleCalendar(t);
       });
     });
   }
@@ -737,6 +750,109 @@
       count++;
     });
     return count;
+  }
+
+  // ---------------- GOOGLE CALENDAR (client-side OAuth, no backend) ----------------
+  // 1) Paste the OAuth Client ID from Google Cloud Console (Credentials > OAuth client ID) below.
+  const GOOGLE_CLIENT_ID = 'PASTE_YOUR_CLIENT_ID_HERE.apps.googleusercontent.com';
+  const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+
+  let gAccessToken = null;
+  let gTokenClient = null;
+
+  function initGoogleAuth(){
+    if(typeof google === 'undefined' || !google.accounts){
+      setStatus('Google sign-in script did not load. Check your connection and reload.');
+      return;
+    }
+    gTokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope: GOOGLE_SCOPE,
+      callback: (resp)=>{
+        if(resp && resp.access_token){
+          gAccessToken = resp.access_token;
+          document.getElementById('gcalDot').style.background = 'var(--leisure)';
+          document.getElementById('gcalConnectBtn').textContent = 'Connected';
+          document.getElementById('gcalImportBtn').disabled = false;
+          setStatus('Connected to Google Calendar.');
+        } else {
+          setStatus('Google sign-in did not return access. Try connecting again.');
+        }
+      }
+    });
+  }
+
+  document.getElementById('gcalConnectBtn').addEventListener('click', ()=>{
+    if(GOOGLE_CLIENT_ID.startsWith('PASTE_')){
+      setStatus('Add your Google OAuth Client ID in the code before connecting.');
+      return;
+    }
+    if(!gTokenClient) initGoogleAuth();
+    if(gTokenClient) gTokenClient.requestAccessToken({ prompt: gAccessToken ? '' : 'consent' });
+  });
+
+  document.getElementById('gcalImportBtn').addEventListener('click', async ()=>{
+    if(!gAccessToken){ setStatus('Connect to Google Calendar first.'); return; }
+    let rs, re;
+    if(view === 'day'){ rs = re = currentDate; }
+    else { const s = startOfWeek(currentDate); rs = s; re = addDays(s,6); }
+    const timeMin = new Date(rs); timeMin.setHours(0,0,0,0);
+    const timeMax = new Date(re); timeMax.setHours(23,59,59,999);
+
+    setStatus('Fetching events from Google Calendar…');
+    try{
+      const url = `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${encodeURIComponent(timeMin.toISOString())}&timeMax=${encodeURIComponent(timeMax.toISOString())}&singleEvents=true&orderBy=startTime`;
+      const resp = await fetch(url, { headers: { Authorization: `Bearer ${gAccessToken}` } });
+      if(resp.status === 401){ setStatus('Session expired — click Connect again.'); gAccessToken=null; return; }
+      const data = await resp.json();
+      let added = 0;
+      (data.items||[]).forEach(ev=>{
+        const title = ev.summary || 'Untitled event';
+        let date, time;
+        if(ev.start.dateTime){
+          const d = new Date(ev.start.dateTime);
+          date = iso(d);
+          time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        } else if(ev.start.date){
+          date = ev.start.date; time = '';
+        } else { return; }
+        // avoid duplicate imports of the same Google event
+        if(tasks.some(t => t.source === 'google' && t.googleId === ev.id)) return;
+        tasks.push({
+          id: genId(), googleId: ev.id, title, type:'event',
+          category: detectCategory(title), date, time, duration:60,
+          priority:'medium', deadline:false, notes:'', completed:false, source:'google'
+        });
+        added++;
+      });
+      setStatus(added > 0 ? `Imported ${added} event(s) from Google Calendar.` : 'No new events found in that range.');
+      renderAll();
+    }catch(err){
+      setStatus('Could not reach Google Calendar. Try again in a moment.');
+    }
+  });
+
+  async function pushToGoogleCalendar(t){
+    if(!gAccessToken){ setStatus('Connect to Google Calendar first, then try again.'); return; }
+    setStatus(`Adding "${t.title}" to Google Calendar…`);
+    try{
+      const body = t.time
+        ? { summary: t.title, description: t.notes||'',
+            start: { dateTime: `${t.date}T${t.time}:00` },
+            end: { dateTime: (()=>{ const d=new Date(`${t.date}T${t.time}:00`); d.setMinutes(d.getMinutes()+(t.duration||30)); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:00`; })() } }
+        : { summary: t.title, description: t.notes||'', start:{date:t.date}, end:{date:t.date} };
+
+      const resp = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+        method:'POST',
+        headers:{ 'Authorization': `Bearer ${gAccessToken}`, 'Content-Type':'application/json' },
+        body: JSON.stringify(body)
+      });
+      if(resp.status === 401){ setStatus('Session expired — click Connect again.'); gAccessToken=null; return; }
+      if(!resp.ok) throw new Error('insert failed');
+      setStatus(`Added "${t.title}" to Google Calendar.`);
+    }catch(err){
+      setStatus('Could not add that event to Google Calendar. Try again in a moment.');
+    }
   }
 
   // ---------------- INIT ----------------
